@@ -225,6 +225,9 @@ func beginEncapsulatedPixelData(obj media.DICOMObject, index int) int {
 
 func appendEncapsulatedFrame(obj media.DICOMObject, index int, payload []byte) int {
 	index++
+	if len(payload)%2 != 0 {
+		payload = append(payload, 0x00)
+	}
 	obj.InsertTag(index, &media.DICOMTag{
 		Group:     0xFFFE,
 		Element:   0xE000,

@@ -98,6 +98,9 @@ func TestMultiFrameTranscodeAcrossSyntaxes(t *testing.T) {
 				if got := obj.GetTransferSyntax().UID; got != ts.UID {
 					t.Fatalf("transfer syntax not updated: got %s want %s", got, ts.UID)
 				}
+				if data, _ := obj.GetPixelData(0); len(data) == 0 || len(data)%2 != 0 {
+					t.Error("PixelData length should not be even")
+				}
 			})
 		}
 	}
