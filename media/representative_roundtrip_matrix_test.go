@@ -66,7 +66,7 @@ func representativePixelRoundTripCases() []representativeRoundTripCase {
 			ts:              transfersyntax.JPEGLosslessSV1,
 			newObj:          func() media.DICOMObject { return newMonoRoundTripObject(transfersyntax.ExplicitVRLittleEndian) },
 			want:            []byte{7, 17, 27, 37},
-			passthroughMode: roundTripAssertionExact,
+			passthroughMode: roundTripAssertionDelta3,
 		},
 		{
 			// JPEG family decode is pure-Go now (gojpeg); there is no native

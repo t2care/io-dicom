@@ -381,10 +381,6 @@ func DIJG8decodeContext(ctx context.Context, jpegData []byte, jpegSize uint32, o
 	jpegData = jpegData[:jpegSize]
 	outputData = outputData[:outputSize]
 
-	if gojpegSOFMarker(jpegData) == mSOF3 {
-		return gojpegDecodeInto(jpegData, outputData)
-	}
-
 	img, err := jpeg.Decode(bytes.NewReader(jpegData))
 	if err != nil {
 		// Fall back to the native libjpeg backend if available. It supports
@@ -393,9 +389,6 @@ func DIJG8decodeContext(ctx context.Context, jpegData []byte, jpegSize uint32, o
 		backend := activeBackend()
 		if n8, ok := backend.(nativeDecode8Backend); ok {
 			return n8.Decode8Context(ctx, jpegData, outputData)
-		}
-		if gojpegSOFMarker(jpegData) == mSOF3 {
-			return gojpegDecodeInto(jpegData, outputData)
 		}
 		return err
 	}
