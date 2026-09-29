@@ -428,23 +428,8 @@ func DIJG8decode(jpegData []byte, jpegSize uint32, outputData []byte, outputSize
 	return DIJG8decodeContext(context.Background(), jpegData, jpegSize, outputData, outputSize)
 }
 
-// EIJG8encode encodes raw pixel bytes to baseline JPEG (or lossless JPEG Process 14 SV1 when mode == 4).
+// EIJG8encode encodes raw pixel bytes to baseline JPEG
 func EIJG8encode(rawData []byte, width uint16, height uint16, samples uint16, outData *[]byte, outSize *int, mode int) error {
-	if mode == 4 {
-		if outData == nil || outSize == nil {
-			return errNilOutputPointers
-		}
-		if len(rawData) > maxCodecPayloadBytes {
-			return errPayloadTooLarge
-		}
-		encoded, err := encodeLosslessJPEG(rawData, int(width), int(height), int(samples), 8)
-		if err != nil {
-			return err
-		}
-		*outData = append((*outData)[:0], encoded...)
-		*outSize = len(encoded)
-		return nil
-	}
 	w, h := int(width), int(height)
 	if w <= 0 || h <= 0 {
 		return errInvalidDimensions
@@ -562,9 +547,11 @@ func EIJG16encodeContext(ctx context.Context, rawData []uint8, width uint16, hei
 	if len(rawData) > maxCodecPayloadBytes {
 		return errPayloadTooLarge
 	}
-	encoded, err := encode16WithContext(ctx, rawData, width, height, samples, mode)
+	encoded, err := encodeLosslessJPEG(rawData, int(width), int(height), int(samples), 8)
 	if err != nil {
-		return err
+		if encoded, err = encode16WithContext(ctx, rawData, width, height, samples, mode); err != nil {
+			return err
+		}
 	}
 	*outData = append((*outData)[:0], encoded...)
 	*outSize = len(encoded)

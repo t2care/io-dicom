@@ -481,14 +481,8 @@ func compress(ctx context.Context, obj media.DICOMObject, i *int, img []byte, RG
 			// encodeLosslessJPEG checks width*height*samples*bps == len(raw)
 			// exactly, so every multi-frame 16-bit object was rejected outright.
 			samples, start, end := frameBounds(j, cols, rows, bitsa, RGB)
-			if bitsa == 8 {
-				if err := jpeg.EIJG8encode(img[start:end], cols, rows, samples, &JPEGData, &JPEGBytes, 4); err != nil {
-					return err
-				}
-			} else {
-				if err := jpeg.EIJG16encodeContext(ctx, img[start:end], cols, rows, samples, &JPEGData, &JPEGBytes, 0); err != nil {
-					return err
-				}
+			if err := jpeg.EIJG16encodeContext(ctx, img[start:end], cols, rows, samples, &JPEGData, &JPEGBytes, 0); err != nil {
+				return err
 			}
 			index = appendEncapsulatedFrame(obj, index, JPEGData)
 			JPEGData = nil
