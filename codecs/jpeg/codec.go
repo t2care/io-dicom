@@ -381,6 +381,10 @@ func DIJG8decodeContext(ctx context.Context, jpegData []byte, jpegSize uint32, o
 	jpegData = jpegData[:jpegSize]
 	outputData = outputData[:outputSize]
 
+	if gojpegSOFMarker(jpegData) == mSOF3 {
+		return gojpegDecodeInto(jpegData, outputData)
+	}
+
 	img, err := jpeg.Decode(bytes.NewReader(jpegData))
 	if err != nil {
 		// Fall back to the native libjpeg backend if available. It supports
@@ -547,7 +551,13 @@ func EIJG16encodeContext(ctx context.Context, rawData []uint8, width uint16, hei
 	if len(rawData) > maxCodecPayloadBytes {
 		return errPayloadTooLarge
 	}
-	encoded, err := encode16WithContext(ctx, rawData, width, height, samples, mode)
+	var encoded []byte
+	var err error
+	if mode == 8 {
+		encoded, err = encodeLosslessJPEG(rawData, int(width), int(height), int(samples), 8)
+	} else {
+		encoded, err = encode16WithContext(ctx, rawData, width, height, samples, 0)
+	}
 	if err != nil {
 		return err
 	}

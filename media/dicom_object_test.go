@@ -554,6 +554,7 @@ func TestRGBRoundTripViaEncapsulatedCodecs(t *testing.T) {
 		{name: "RLELossless", ts: transfersyntax.RLELossless},
 		{name: "EncapsulatedUncompressedExplicitVRLittleEndian", ts: transfersyntax.EncapsulatedUncompressedExplicitVRLittleEndian},
 		{name: "DeflatedImageFrameCompression", ts: transfersyntax.DeflatedImageFrameCompression},
+		{name: "JPEGLosslessSV1", ts: transfersyntax.JPEGLosslessSV1},
 	}
 
 	for _, tt := range tests {
