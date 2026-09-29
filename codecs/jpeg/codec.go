@@ -551,11 +551,15 @@ func EIJG16encodeContext(ctx context.Context, rawData []uint8, width uint16, hei
 	if len(rawData) > maxCodecPayloadBytes {
 		return errPayloadTooLarge
 	}
-	encoded, err := encodeLosslessJPEG(rawData, int(width), int(height), int(samples), 8)
+	var encoded []byte
+	var err error
+	if mode == 8 {
+		encoded, err = encodeLosslessJPEG(rawData, int(width), int(height), int(samples), 8)
+	} else {
+		encoded, err = encode16WithContext(ctx, rawData, width, height, samples, 0)
+	}
 	if err != nil {
-		if encoded, err = encode16WithContext(ctx, rawData, width, height, samples, mode); err != nil {
-			return err
-		}
+		return err
 	}
 	*outData = append((*outData)[:0], encoded...)
 	*outSize = len(encoded)
