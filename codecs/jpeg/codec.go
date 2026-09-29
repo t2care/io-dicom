@@ -428,7 +428,7 @@ func DIJG8decode(jpegData []byte, jpegSize uint32, outputData []byte, outputSize
 	return DIJG8decodeContext(context.Background(), jpegData, jpegSize, outputData, outputSize)
 }
 
-// EIJG8encode encodes raw pixel bytes to baseline JPEG
+// EIJG8encode encodes raw pixel bytes to baseline JPEG.
 func EIJG8encode(rawData []byte, width uint16, height uint16, samples uint16, outData *[]byte, outSize *int, mode int) error {
 	w, h := int(width), int(height)
 	if w <= 0 || h <= 0 {
