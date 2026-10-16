@@ -23,19 +23,42 @@ const (
 // a lossy VarDCT JPEG XL codestream. globalScale sets the quality: larger means
 // finer quantization (higher quality, larger output). A good default is ~4096.
 func EncodeVarDCT(pixels []byte, w, h, channels, globalScale int) ([]byte, error) {
+	return EncodeVarDCTWithBitDepth(pixels, w, h, channels, 8, globalScale)
+}
+
+// EncodeVarDCTWithBitDepth compresses interleaved 1..16-bit sRGB samples
+// (grayscale or RGB; little-endian uint16 when bitdepth > 8) into a lossy VarDCT
+// JPEG XL codestream using real ANS histograms and context-clustered AC coding.
+func EncodeVarDCTWithBitDepth(pixels []byte, w, h, channels, bitdepth, globalScale int) ([]byte, error) {
 	if w <= 0 || h <= 0 || w > 1<<14 || h > 1<<14 {
 		return nil, errors.New("gojxl: VarDCT encode supports 1..16384 px per dimension")
 	}
 	if channels != 1 && channels != 3 {
 		return nil, errors.New("gojxl: VarDCT encode supports 1 or 3 channels")
 	}
-	if len(pixels) != w*h*channels {
+	if bitdepth < 1 || bitdepth > 16 {
+		return nil, errors.New("gojxl: VarDCT encode supports 1..16 bit depth")
+	}
+	bps := 1
+	if bitdepth > 8 {
+		bps = 2
+	}
+	if len(pixels) != w*h*channels*bps {
 		return nil, errors.New("gojxl: pixel buffer size mismatch")
 	}
 	if globalScale < 1 || globalScale > 1<<20 {
 		return nil, errors.New("gojxl: globalScale out of range")
 	}
 	gray := channels == 1
+	maxVal := float32((int(1) << uint(bitdepth)) - 1)
+	readSample := func(sampleIdx int) float32 {
+		if bps == 1 {
+			return float32(pixels[sampleIdx]) / maxVal
+		}
+		off := sampleIdx * 2
+		v := uint32(pixels[off]) | (uint32(pixels[off+1]) << 8)
+		return float32(v) / maxVal
+	}
 
 	// ----- sRGB -> linear -> XYB planes (full resolution) -----
 	planeX := make([]float32, w*h)
@@ -44,12 +67,12 @@ func EncodeVarDCT(pixels []byte, w, h, channels, globalScale int) ([]byte, error
 	for i := 0; i < w*h; i++ {
 		var r, g, b float32
 		if gray {
-			v := srgbToLinear(float32(pixels[i]) / 255)
+			v := srgbToLinear(readSample(i))
 			r, g, b = v, v, v
 		} else {
-			r = srgbToLinear(float32(pixels[i*3+0]) / 255)
-			g = srgbToLinear(float32(pixels[i*3+1]) / 255)
-			b = srgbToLinear(float32(pixels[i*3+2]) / 255)
+			r = srgbToLinear(readSample(i*3 + 0))
+			g = srgbToLinear(readSample(i*3 + 1))
+			b = srgbToLinear(readSample(i*3 + 2))
 		}
 		planeX[i], planeY[i], planeB[i] = linearRGBToXYB(r, g, b)
 	}
@@ -156,43 +179,64 @@ func EncodeVarDCT(pixels []byte, w, h, channels, globalScale int) ([]byte, error
 	// Modular DC channel order is Y, X, B.
 	dcMod := [3][]int32{dcInt[1], dcInt[0], dcInt[2]}
 
-	return assembleVarDCT(w, h, bw, bh, gray, globalScale, dcMod, acCoeff, order)
+	return assembleVarDCT(w, h, bw, bh, gray, bitdepth, globalScale, dcMod, acCoeff, order)
 }
 
 // assembleVarDCT writes the full VarDCT codestream. Images larger than one
-// group (256px) are split into the decoder's section layout (LfGlobal, one DC
-// group, HfGlobal, then one section per AC group).
-func assembleVarDCT(w, h, bw, bh int, gray bool, globalScale int,
+// group (256px) are split into the decoder's section layout (LfGlobal, DC
+// groups, HfGlobal, then one section per AC group).
+func assembleVarDCT(w, h, bw, bh int, gray bool, bitdepth, globalScale int,
 	dcMod [3][]int32, acCoeff [3][][]int32, order []int) ([]byte, error) {
 
 	fd := computeFrameDimensions(uint32(w), uint32(h), 1, 1) // group_size_shift = 1
 	numGroups := int(fd.numGroups)
+	dcGroupDim := int(fd.groupDim)
+	ndgx := divCeilInt(bw, dcGroupDim)
+	numDCGroups := int(fd.numDCGroups)
 
-	// ----- modular global sub-streams: DC image + AC metadata -----
-	var dcTokens []encToken
-	for c := 0; c < 3; c++ {
-		dcTokens = gradientTokens(dcMod[c], bw, 0, 0, bw, bh, dcTokens)
+	// ----- modular DC groups: DC image + AC metadata -----
+	type dcGroupTok struct {
+		dcTk, acmTk []encTokenized
+		count       int
+		acmAlphabet int
 	}
-	ctW, ctH := (bw+7)>>3, (bh+7)>>3
-	count := bw * bh
-	acsqf := make([]int32, count*2) // row0 ACS=0 (DCT8x8), row1 QF=0
-	var acmTokens []encToken
-	acmTokens = gradientTokens(make([]int32, ctW*ctH), ctW, 0, 0, ctW, ctH, acmTokens) // ytox = 0
-	acmTokens = gradientTokens(make([]int32, ctW*ctH), ctW, 0, 0, ctW, ctH, acmTokens) // ytob = 0
-	acmTokens = gradientTokens(acsqf, count, 0, 0, count, 2, acmTokens)
-	acmTokens = gradientTokens(make([]int32, bw*bh), bw, 0, 0, bw, bh, acmTokens) // EPF = 0
-	dcTk, dcMax := tokenizeAll(dcTokens)
-	acmTk, acmMax := tokenizeAll(acmTokens)
-	modAlphabet := maxInt(dcMax, acmMax) + 1
+	dcGroups := make([]dcGroupTok, numDCGroups)
+	modAlphabet := 0
+	var modTkGroups [][]encTokenized
+	for g := 0; g < numDCGroups; g++ {
+		gx, gy := g%ndgx, g/ndgx
+		bx0, by0 := gx*dcGroupDim, gy*dcGroupDim
+		gbw := minInt(dcGroupDim, bw-bx0)
+		gbh := minInt(dcGroupDim, bh-by0)
 
-	// ----- AC coefficients, tokenized per group -----
-	perGroupAC, acMax := acTokensByGroup(fd, bw, bh, acCoeff, order)
+		var dcTokens []encToken
+		for c := 0; c < 3; c++ {
+			dcTokens = gradientTokens(dcMod[c], bw, bx0, by0, gbw, gbh, dcTokens)
+		}
+		gctW, gctH := (gbw+7)>>3, (gbh+7)>>3
+		count := gbw * gbh
+		var acmTokens []encToken
+		acmTokens = gradientTokens(make([]int32, gctW*gctH), gctW, 0, 0, gctW, gctH, acmTokens) // ytox = 0
+		acmTokens = gradientTokens(make([]int32, gctW*gctH), gctW, 0, 0, gctW, gctH, acmTokens) // ytob = 0
+		acmTokens = gradientTokens(make([]int32, count*2), count, 0, 0, count, 2, acmTokens)    // ACS=0, QF=0
+		acmTokens = gradientTokens(make([]int32, gbw*gbh), gbw, 0, 0, gbw, gbh, acmTokens)      // EPF = 0
+
+		dcTk, dcMax := tokenizeAll(dcTokens)
+		acmTk, acmMax := tokenizeAll(acmTokens)
+		dcGroups[g] = dcGroupTok{dcTk: dcTk, acmTk: acmTk, count: count, acmAlphabet: acmMax + 1}
+		modAlphabet = maxInt(modAlphabet, dcMax)
+		modTkGroups = append(modTkGroups, dcTk)
+	}
+	modAlphabet++
+
+	// ----- AC coefficients, tokenized per group with real VarDCT contexts -----
+	perGroupAC, acMax, _ := acTokensByGroupJPEGCtx(fd, bw, bh, acCoeff, order, [3]int{}, [3]int{})
 	acAlphabet := acMax + 1
 	acCtxCount := defaultBlockCtxMap().numACContexts()
 
 	single := numGroups == 1
 
-	// LfGlobal: global DC info + modular tree + shared modular histogram.
+	// LfGlobal: global DC info + modular tree + shared modular DC histogram.
 	lf := newBitWriter()
 	lf.WriteBool(true) // DequantMatrices DC all_default
 	lf.WriteU32(uint32(globalScale), qGlobalScaleDist[0], qGlobalScaleDist[1], qGlobalScaleDist[2], qGlobalScaleDist[3])
@@ -201,52 +245,58 @@ func assembleVarDCT(w, h, bw, bh int, gray bool, globalScale int,
 	lf.WriteBits(1, 1) // CfL: all_default
 	lf.WriteBits(1, 1) // has_tree
 	encodeANSStream(lf, maTreeTokens, numTreeContexts)
-	modRev, modFreq := writeANSFlatHeader(lf, modAlphabet, 1)
+	modRev, modFreq := writeANSRealHeader(lf, modAlphabet, 1, modTkGroups...)
 
-	// DC group: VarDCT DC image + AC metadata (separate ANS streams).
-	dcw := lf
-	if !single {
-		dcw = newBitWriter()
+	writeDCGroup := func(dcw *bitWriter, g int) {
+		dcw.WriteBits(0, 2) // extra_precision = 0
+		writeModularGroupHeader(dcw)
+		encodeANSData(dcw, ansEncState{tokens: dcGroups[g].dcTk, revMap: modRev, freqs: modFreq})
+		dcw.WriteBits(uint64(dcGroups[g].count-1), ceilLog2Nonzero(uint32(dcGroups[g].count)))
+		writeModularGroupHeaderLocal(dcw)
+		encodeANSStream(dcw, maTreeTokens, numTreeContexts)
+		acmRev, acmFreq := writeANSRealHeader(dcw, dcGroups[g].acmAlphabet, 1, dcGroups[g].acmTk)
+		encodeANSData(dcw, ansEncState{tokens: dcGroups[g].acmTk, revMap: acmRev, freqs: acmFreq})
 	}
-	dcw.WriteBits(0, 2) // extra_precision = 0
-	writeModularGroupHeader(dcw)
-	encodeANSData(dcw, ansEncState{tokens: dcTk, revMap: modRev, freqs: modFreq})
-	dcw.WriteBits(uint64(count-1), ceilLog2Nonzero(uint32(bw*bh)))
-	writeModularGroupHeader(dcw)
-	encodeANSData(dcw, ansEncState{tokens: acmTk, revMap: modRev, freqs: modFreq})
 
-	// HfGlobal: dequant matrices + coeff orders + shared AC histogram.
-	hf := lf
-	if !single {
-		hf = newBitWriter()
+	writeHfGlobal := func(hf *bitWriter) (ctxToCluster []uint8, clRev [][][]uint16, clFreq [][]uint16) {
+		hf.WriteBits(1, 1)                                                     // AC dequant matrices all_default
+		hf.WriteBits(0, ceilLog2Nonzero(fd.numGroups))                         // num_histograms - 1 = 0
+		hf.WriteU32(0, kOrderEnc[0], kOrderEnc[1], kOrderEnc[2], kOrderEnc[3]) // used_orders = 0 (natural)
+		return writeACEntropyHeader(hf, perGroupAC, acAlphabet, acCtxCount)
 	}
-	hf.WriteBits(1, 1)                                                     // AC dequant matrices all_default
-	hf.WriteBits(0, ceilLog2Nonzero(fd.numGroups))                         // num_histograms - 1 = 0
-	hf.WriteU32(0, kOrderEnc[0], kOrderEnc[1], kOrderEnc[2], kOrderEnc[3]) // used_orders = 0 (natural)
-	acRev, acFreq := writeANSFlatHeader(hf, acAlphabet, acCtxCount)
 
-	// AC groups.
 	if single {
-		encodeANSData(lf, ansEncState{tokens: perGroupAC[0], revMap: acRev, freqs: acFreq})
-		return finishVarDCT(w, h, gray, [][]byte{lf.Bytes()}, fd)
+		writeDCGroup(lf, 0)
+		ctxToCluster, clRev, clFreq := writeHfGlobal(lf)
+		encodeACDataMulti(lf, perGroupAC[0], ctxToCluster, clRev, clFreq)
+		return finishVarDCT(w, h, gray, bitdepth, [][]byte{lf.Bytes()}, fd)
 	}
-	sections := make([][]byte, 0, 3+numGroups)
-	sections = append(sections, lf.Bytes(), dcw.Bytes(), hf.Bytes())
+
+	sections := make([][]byte, 0, 2+numDCGroups+numGroups)
+	sections = append(sections, lf.Bytes())
+	for g := 0; g < numDCGroups; g++ {
+		dcw := newBitWriter()
+		writeDCGroup(dcw, g)
+		sections = append(sections, dcw.Bytes())
+	}
+	hf := newBitWriter()
+	ctxToCluster, clRev, clFreq := writeHfGlobal(hf)
+	sections = append(sections, hf.Bytes())
 	for g := 0; g < numGroups; g++ {
 		gw := newBitWriter()
-		encodeANSData(gw, ansEncState{tokens: perGroupAC[g], revMap: acRev, freqs: acFreq})
+		encodeACDataMulti(gw, perGroupAC[g], ctxToCluster, clRev, clFreq)
 		sections = append(sections, gw.Bytes())
 	}
-	return finishVarDCT(w, h, gray, sections, fd)
+	return finishVarDCT(w, h, gray, bitdepth, sections, fd)
 }
 
 // finishVarDCT writes the container headers + TOC and assembles the codestream.
 // For a single section the TOC has one entry; for multiple sections the order is
-// LfGlobal, numDCGroups (=1) DC group, HfGlobal, then the AC groups.
-func finishVarDCT(w, h int, gray bool, sections [][]byte, fd frameDimensions) ([]byte, error) {
+// LfGlobal, numDCGroups DC groups, HfGlobal, then the AC groups.
+func finishVarDCT(w, h int, gray bool, bitdepth int, sections [][]byte, fd frameDimensions) ([]byte, error) {
 	m := newBitWriter()
 	writeSizeHeader(m, w, h)
-	writeVarDCTImageMetadata(m, gray)
+	writeVarDCTImageMetadata(m, gray, bitdepth)
 	m.WriteBool(true) // transform_data all_default
 	m.ZeroPadToByte()
 	writeVarDCTFrameHeader(m)
@@ -338,12 +388,12 @@ func writeModularGroupHeaderLocal(s *bitWriter) {
 }
 
 // writeVarDCTImageMetadata writes ImageMetadata for an XYB VarDCT image.
-func writeVarDCTImageMetadata(w *bitWriter, gray bool) {
-	w.WriteBool(false)                                             // all_default
-	w.WriteBool(false)                                             // extra_fields
-	w.WriteBool(false)                                             // floating_point_sample
-	w.WriteU32(8, u32Val(8), u32Val(10), u32Val(12), u32Off(6, 1)) // bits_per_sample = 8
-	w.WriteBool(true)                                              // modular_16bit_buffer_sufficient
+func writeVarDCTImageMetadata(w *bitWriter, gray bool, bitdepth int) {
+	w.WriteBool(false)                                                            // all_default
+	w.WriteBool(false)                                                            // extra_fields
+	w.WriteBool(false)                                                            // floating_point_sample
+	w.WriteU32(uint32(bitdepth), u32Val(8), u32Val(10), u32Val(12), u32Off(6, 1)) // bits_per_sample
+	w.WriteBool(bitdepth <= 14)                                                   // modular_16bit_buffer_sufficient
 	w.WriteU32(0, u32Val(0), u32Val(1), u32Off(4, 2), u32Off(12, 1))
 	w.WriteBool(true) // xyb_encoded = true
 	writeColorEncoding(w, gray)

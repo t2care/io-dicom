@@ -113,3 +113,120 @@ func encapsulatedFrames(t *testing.T, obj media.DICOMObject, n int) [][]byte {
 	t.Fatal("no pixel data tag found after transcode")
 	return nil
 }
+
+func TestJPEGXLRecompressionRejectsNonJPEGWithoutMutation(t *testing.T) {
+	// 1. Uncompressed source -> .111 must fail cleanly without mutating obj.
+	obj, err := media.NewDCMObjFromFile("../testdata/MR")
+	if err != nil {
+		t.Skipf("MR fixture unavailable: %v", err)
+	}
+	origTS := obj.GetTransferSyntax().UID
+	origTagCount := obj.TagCount()
+	origPixel := append([]byte(nil), obj.GetTag(tags.PixelData).Data...)
+
+	if err := transcoder.ChangeTransferSyntax(obj, transfersyntax.JPEGXLJPEGRecompression); err == nil {
+		t.Fatal("expected error transcoding uncompressed MR directly to .111")
+	}
+	if got := obj.GetTransferSyntax().UID; got != origTS {
+		t.Fatalf("transfer syntax mutated on error: got %s, want %s", got, origTS)
+	}
+	if got := obj.TagCount(); got != origTagCount {
+		t.Fatalf("tag count mutated on error: got %d, want %d", got, origTagCount)
+	}
+	if !bytes.Equal(obj.GetTag(tags.PixelData).Data, origPixel) {
+		t.Fatal("pixel data mutated on error")
+	}
+
+	// 2. Encapsulated non-JPEG (.70 JPEGLosslessSV1) source -> .111 must fail
+	// cleanly without stripping its encapsulated fragments.
+	if err := transcoder.ChangeTransferSyntax(obj, transfersyntax.JPEGLosslessSV1); err != nil {
+		t.Fatalf("transcode to .70: %v", err)
+	}
+	sv1Frames := encapsulatedFrames(t, obj, 1)
+	sv1FrameCopy := append([]byte(nil), sv1Frames[0]...)
+	sv1TagCount := obj.TagCount()
+
+	if err := transcoder.ChangeTransferSyntax(obj, transfersyntax.JPEGXLJPEGRecompression); err == nil {
+		t.Fatal("expected error transcoding .70 to .111")
+	}
+	if got := obj.GetTransferSyntax().UID; got != transfersyntax.JPEGLosslessSV1.UID {
+		t.Fatalf("transfer syntax mutated on error: got %s", got)
+	}
+	if got := obj.TagCount(); got != sv1TagCount {
+		t.Fatalf("encapsulated tags stripped on error: got %d, want %d", got, sv1TagCount)
+	}
+	afterFrames := encapsulatedFrames(t, obj, 1)
+	if !bytes.Equal(afterFrames[0], sv1FrameCopy) {
+		t.Fatal("encapsulated frame data mutated on error")
+	}
+}
+
+func TestJPEGXLCompressionRatioOnMR(t *testing.T) {
+	origObj, err := media.NewDCMObjFromFile("../testdata/MR")
+	if err != nil {
+		t.Skipf("MR fixture unavailable: %v", err)
+	}
+	rawPixels := append([]byte(nil), origObj.GetTag(tags.PixelData).Data...)
+	rawSize := len(rawPixels)
+
+	// Transcode to JPEGLosslessSV1 (.70) as baseline reference.
+	sv1Obj, err := media.NewDCMObjFromFile("../testdata/MR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transcoder.ChangeTransferSyntax(sv1Obj, transfersyntax.JPEGLosslessSV1); err != nil {
+		t.Fatalf("transcode to JPEGLosslessSV1: %v", err)
+	}
+	sv1Size := len(encapsulatedFrames(t, sv1Obj, 1)[0])
+
+	// Transcode to JPEGXLLossless (.110).
+	jxlLosslessObj, err := media.NewDCMObjFromFile("../testdata/MR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transcoder.ChangeTransferSyntax(jxlLosslessObj, transfersyntax.JPEGXLLossless); err != nil {
+		t.Fatalf("transcode to JPEGXLLossless: %v", err)
+	}
+	jxlLosslessSize := len(encapsulatedFrames(t, jxlLosslessObj, 1)[0])
+
+	// Verify exact lossless round-trip of .110 back to ExplicitVRLittleEndian.
+	if err := transcoder.ChangeTransferSyntax(jxlLosslessObj, transfersyntax.ExplicitVRLittleEndian); err != nil {
+		t.Fatalf("round-trip .110 -> ExplicitVRLittleEndian: %v", err)
+	}
+	if !bytes.Equal(jxlLosslessObj.GetTag(tags.PixelData).Data, rawPixels) {
+		t.Fatal("JPEGXLLossless round-trip pixel data mismatch")
+	}
+
+	// Transcode to lossy JPEGXL (.112) on 16-bit MR.
+	jxlLossyObj, err := media.NewDCMObjFromFile("../testdata/MR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transcoder.ChangeTransferSyntax(jxlLossyObj, transfersyntax.JPEGXL); err != nil {
+		t.Fatalf("transcode to JPEGXL (.112): %v", err)
+	}
+	jxlLossySize := len(encapsulatedFrames(t, jxlLossyObj, 1)[0])
+
+	// Verify .112 decodes back to ExplicitVRLittleEndian with matching byte length.
+	if err := transcoder.ChangeTransferSyntax(jxlLossyObj, transfersyntax.ExplicitVRLittleEndian); err != nil {
+		t.Fatalf("round-trip .112 -> ExplicitVRLittleEndian: %v", err)
+	}
+	if got := len(jxlLossyObj.GetTag(tags.PixelData).Data); got != rawSize {
+		t.Fatalf("JPEGXL (.112) decoded size = %d, want %d", got, rawSize)
+	}
+
+	t.Logf("MR (512x512x16-bit) sizes: raw=%d B, JPEGLosslessSV1=%d B (%.2fx), JPEGXLLossless=%d B (%.2fx), JPEGXL(lossy)=%d B (%.2fx)",
+		rawSize,
+		sv1Size, float64(rawSize)/float64(sv1Size),
+		jxlLosslessSize, float64(rawSize)/float64(jxlLosslessSize),
+		jxlLossySize, float64(rawSize)/float64(jxlLossySize),
+	)
+
+	if jxlLosslessSize >= sv1Size {
+		t.Errorf("expected JPEGXLLossless (%d B) < JPEGLosslessSV1 (%d B)", jxlLosslessSize, sv1Size)
+	}
+	if jxlLossySize >= jxlLosslessSize {
+		t.Errorf("expected lossy JPEGXL (%d B) < JPEGXLLossless (%d B)", jxlLossySize, jxlLosslessSize)
+	}
+}
+

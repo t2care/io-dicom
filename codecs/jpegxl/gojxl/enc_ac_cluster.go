@@ -177,7 +177,9 @@ func writeACEntropyHeader(w *bitWriter, perGroupAC [][]encTokenized, alphabet, n
 	}
 
 	w.WriteBool(false) // lz77 disabled
-	writeContextMap(w, ctxToCluster, numClusters)
+	if numContexts > 1 {
+		writeContextMap(w, ctxToCluster, numClusters)
+	}
 	w.WriteBits(0, 1)                     // use_prefix_code = 0 (ANS)
 	w.WriteBits(uint64(encLogAlpha-5), 2) // log_alpha_size
 	for c := 0; c < numClusters; c++ {

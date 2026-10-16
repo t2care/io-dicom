@@ -112,9 +112,10 @@ func ChangeTransferSyntaxContext(ctx context.Context, obj media.DICOMObject, out
 				// Lossless JPEG Baseline -> JPEG XL JPEG-Recompression transcodes
 				// the original encapsulated JPEG bytes directly (no pixel decode),
 				// so the result reconstructs each source JPEG byte-for-byte.
-				if obj.GetTransferSyntax().UID == transfersyntax.JPEGBaseline8Bit.UID &&
-					outTS.UID == transfersyntax.JPEGXLJPEGRecompression.UID &&
-					tag.Length == 0xFFFFFFFF {
+				if outTS.UID == transfersyntax.JPEGXLJPEGRecompression.UID {
+					if obj.GetTransferSyntax().UID != transfersyntax.JPEGBaseline8Bit.UID || tag.Length != 0xFFFFFFFF {
+						return fmt.Errorf("transcoder: JPEGXLJPEGRecompression requires an encapsulated JPEGBaseline8Bit source (got %s)", obj.GetTransferSyntax().UID)
+					}
 					if frames == 0 {
 						frames = 1
 					}
@@ -204,7 +205,29 @@ func tsTagEncoding(uid string) (explicitVR, bigEndian bool) {
 	}
 }
 
+// stripEncapsulatedItems removes any existing encapsulated child items
+// (basic offset table, frame fragments, and sequence delimiter) immediately
+// following the pixel-data tag at index.
+func stripEncapsulatedItems(obj media.DICOMObject, index int) {
+	tag := obj.GetTagAt(index)
+	if tag == nil || tag.Length != 0xFFFFFFFF {
+		return
+	}
+	for index+1 < obj.TagCount() {
+		next := obj.GetTagAt(index + 1)
+		if next == nil || next.Group != 0xFFFE || (next.Element != 0xE000 && next.Element != 0xE0DD) {
+			break
+		}
+		isDelim := next.Element == 0xE0DD
+		obj.DelTag(index + 1)
+		if isDelim {
+			break
+		}
+	}
+}
+
 func beginEncapsulatedPixelData(obj media.DICOMObject, index int) int {
+	stripEncapsulatedItems(obj, index)
 	tag := obj.GetTagAt(index)
 	tag.VR = "OB"
 	tag.Length = 0xFFFFFFFF
@@ -429,51 +452,47 @@ func compress(ctx context.Context, obj media.DICOMObject, i *int, img []byte, RG
 
 	switch outTS {
 	case transfersyntax.DeflatedImageFrameCompression.UID:
-		index = beginEncapsulatedPixelData(obj, index)
-
+		encodedFrames := make([][]byte, 0, frames)
 		for j = 0; j < frames; j++ {
 			offset = j * frameSize
 			deflated, err := deflate.DeflateFrame(img[offset : offset+frameSize])
 			if err != nil {
 				return err
 			}
-			index = appendEncapsulatedFrame(obj, index, deflated)
+			encodedFrames = append(encodedFrames, deflated)
 		}
-		index = endEncapsulatedPixelData(obj, index)
+		index = appendEncapsulatedFrames(obj, index, encodedFrames)
 		*i = index
 	case transfersyntax.EncapsulatedUncompressedExplicitVRLittleEndian.UID:
-		index = beginEncapsulatedPixelData(obj, index)
-
+		encodedFrames := make([][]byte, 0, frames)
 		for j = 0; j < frames; j++ {
 			offset = j * frameSize
 			frameData := make([]byte, frameSize)
 			copy(frameData, img[offset:offset+frameSize])
-			index = appendEncapsulatedFrame(obj, index, frameData)
+			encodedFrames = append(encodedFrames, frameData)
 		}
-		index = endEncapsulatedPixelData(obj, index)
+		index = appendEncapsulatedFrames(obj, index, encodedFrames)
 		*i = index
 	case transfersyntax.RLELossless.UID:
-		index = beginEncapsulatedPixelData(obj, index)
-
 		samplesPerPixel := uint16(1)
 		if RGB {
 			samplesPerPixel = 3
 		}
-
+		encodedFrames := make([][]byte, 0, frames)
 		for j = 0; j < frames; j++ {
 			offset = j * frameSize
 			rleData, err := rle.RLEencode(img[offset:offset+frameSize], rows, cols, bitsa, samplesPerPixel)
 			if err != nil {
 				return err
 			}
-			index = appendEncapsulatedFrame(obj, index, rleData)
+			encodedFrames = append(encodedFrames, rleData)
 		}
-		index = endEncapsulatedPixelData(obj, index)
+		index = appendEncapsulatedFrames(obj, index, encodedFrames)
 		*i = index
 	case transfersyntax.JPEGLosslessSV1.UID:
 		fallthrough
 	case transfersyntax.JPEGLossless.UID:
-		index = beginEncapsulatedPixelData(obj, index)
+		encodedFrames := make([][]byte, 0, frames)
 		for j = 0; j < frames; j++ {
 			// frameBounds gives this frame's [start,end). The previous code
 			// built a byte offset and then handed the 16-bit encoder
@@ -484,13 +503,13 @@ func compress(ctx context.Context, obj media.DICOMObject, i *int, img []byte, RG
 			if err := jpeg.EIJG16encodeContext(ctx, img[start:end], cols, rows, samples, &JPEGData, &JPEGBytes, int(bitsa)); err != nil {
 				return err
 			}
-			index = appendEncapsulatedFrame(obj, index, JPEGData)
+			encodedFrames = append(encodedFrames, JPEGData)
 			JPEGData = nil
 		}
-		index = endEncapsulatedPixelData(obj, index)
+		index = appendEncapsulatedFrames(obj, index, encodedFrames)
 		*i = index
 	case transfersyntax.JPEGBaseline8Bit.UID:
-		index = beginEncapsulatedPixelData(obj, index)
+		encodedFrames := make([][]byte, 0, frames)
 		for j = 0; j < frames; j++ {
 			samples, start, end := frameBounds(j, cols, rows, bitsa, RGB)
 			if bitsa == 8 {
@@ -502,22 +521,22 @@ func compress(ctx context.Context, obj media.DICOMObject, i *int, img []byte, RG
 					return err
 				}
 			}
-			index = appendEncapsulatedFrame(obj, index, JPEGData)
+			encodedFrames = append(encodedFrames, JPEGData)
 			JPEGData = nil
 		}
-		index = endEncapsulatedPixelData(obj, index)
+		index = appendEncapsulatedFrames(obj, index, encodedFrames)
 		*i = index
 	case transfersyntax.JPEGExtended12Bit.UID:
-		index = beginEncapsulatedPixelData(obj, index)
+		encodedFrames := make([][]byte, 0, frames)
 		for j = 0; j < frames; j++ {
 			samples, start, end := frameBounds(j, cols, rows, bitsa, RGB)
 			if err := jpeg.EIJG12encodeContext(ctx, img[start:end], cols, rows, samples, &JPEGData, &JPEGBytes, 0); err != nil {
 				return err
 			}
-			index = appendEncapsulatedFrame(obj, index, JPEGData)
+			encodedFrames = append(encodedFrames, JPEGData)
 			JPEGData = nil
 		}
-		index = endEncapsulatedPixelData(obj, index)
+		index = appendEncapsulatedFrames(obj, index, encodedFrames)
 		*i = index
 	case transfersyntax.JPEGLSLossless.UID:
 		fallthrough
@@ -580,9 +599,9 @@ func compress(ctx context.Context, obj media.DICOMObject, i *int, img []byte, RG
 		}
 		index = appendEncapsulatedFrames(obj, index, frameData)
 		*i = index
-	case transfersyntax.JPEGXLLossless.UID:
-		fallthrough
 	case transfersyntax.JPEGXLJPEGRecompression.UID:
+		return fmt.Errorf("transcoder: JPEGXLJPEGRecompression requires an encapsulated JPEGBaseline8Bit source")
+	case transfersyntax.JPEGXLLossless.UID:
 		fallthrough
 	case transfersyntax.JPEGXL.UID:
 		lossless := outTS == transfersyntax.JPEGXLLossless.UID
@@ -651,7 +670,7 @@ func compress(ctx context.Context, obj media.DICOMObject, i *int, img []byte, RG
 	case transfersyntax.HEVCMP51.UID:
 		fallthrough
 	case transfersyntax.HEVCM10P51.UID:
-		index = beginEncapsulatedPixelData(obj, index)
+		mpegFrames := make([][]byte, 0, frames)
 		for j = 0; j < frames; j++ {
 			// frameBounds gives this frame's [start,end). The previous code
 			// sliced img[offset:] open-ended to the end of the whole multi-frame
@@ -662,28 +681,29 @@ func compress(ctx context.Context, obj media.DICOMObject, i *int, img []byte, RG
 			if err := mpeg.MPEGencodeContext(ctx, img[start:end], cols, rows, samples, bitsa, &JPEGData, &JPEGBytes, outTS); err != nil {
 				return err
 			}
-			index = appendEncapsulatedFrame(obj, index, JPEGData)
+			mpegFrames = append(mpegFrames, JPEGData)
 			JPEGData = nil
 		}
-		index = endEncapsulatedPixelData(obj, index)
+		index = appendEncapsulatedFrames(obj, index, mpegFrames)
 		*i = index
 	case transfersyntax.SMPTEST211020UncompressedProgressiveActiveVideo.UID:
 		fallthrough
 	case transfersyntax.SMPTEST211020UncompressedInterlacedActiveVideo.UID:
 		fallthrough
 	case transfersyntax.SMPTEST211030PCMDigitalAudio.UID:
-		index = beginEncapsulatedPixelData(obj, index)
+		smpteFrames := make([][]byte, 0, frames)
 		for j = 0; j < frames; j++ {
 			samples, start, end := frameBounds(j, cols, rows, bitsa, RGB)
 			if err := smpte2110.SMPTE2110encodeContext(ctx, img[start:end], cols, rows, samples, bitsa, &JPEGData, &JPEGBytes, outTS); err != nil {
 				return err
 			}
-			index = appendEncapsulatedFrame(obj, index, JPEGData)
+			smpteFrames = append(smpteFrames, JPEGData)
 			JPEGData = nil
 		}
-		index = endEncapsulatedPixelData(obj, index)
+		index = appendEncapsulatedFrames(obj, index, smpteFrames)
 		*i = index
 	default:
+		stripEncapsulatedItems(obj, index)
 		if bitss == 8 {
 			tag.VR = "OB"
 		} else {
@@ -704,22 +724,20 @@ func uncompress(ctx context.Context, obj media.DICOMObject, i int, img []byte, s
 	single := size / frames
 	tsUID := obj.GetTransferSyntax().UID
 
-	// Collect the compressed payload for every frame first (cheap, and the tag
-	// references stay valid after deletion), then decode them concurrently into
-	// disjoint regions of img. Decoding is the expensive part and each frame is
-	// independent, so this is where the parallelism pays off; the object is only
-	// mutated here on the single goroutine.
-	obj.DelTag(i + 1) // Delete offset table.
+	// Collect the compressed payload for every frame without mutating obj, so a
+	// failure during decompression or subsequent re-encoding leaves the original
+	// encapsulated pixel-data items intact.
+	if obj.GetTagAt(i+1) == nil {
+		return fmt.Errorf("transcoder: missing offset table for transfer syntax %s", tsUID)
+	}
 	frameData := make([][]byte, frames)
 	for j := uint32(0); j < frames; j++ {
-		tag := obj.GetTagAt(i + 1)
-		if tag == nil {
+		tag := obj.GetTagAt(i + 2 + int(j))
+		if tag == nil || tag.Group != 0xFFFE || tag.Element != 0xE000 {
 			return fmt.Errorf("transcoder: missing frame %d for transfer syntax %s", j, tsUID)
 		}
 		frameData[j] = tag.Data
-		obj.DelTag(i + 1)
 	}
-	obj.DelTag(i + 1) // Delete sequence delimiter.
 
 	return runFrameJobs(ctx, frames, func(fctx context.Context, j uint32) error {
 		offset := j * single

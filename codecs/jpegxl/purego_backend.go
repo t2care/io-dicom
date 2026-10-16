@@ -46,13 +46,13 @@ func (gojpegxlBackend) Decode(encoded []byte, output []byte) (err error) {
 	return nil
 }
 
-// kLossyGlobalScale is the VarDCT quantizer scale used for lossy encoding — a
-// high-quality (visually near-lossless) default suitable for medical imagery.
-const kLossyGlobalScale = 32768
+// kLossyGlobalScale is the base VarDCT quantizer scale used for lossy encoding
+// (8192 = qf 1.0 in JPEG XL's 65536-denominated globalScale).
+const kLossyGlobalScale = 8192
 
 // Encode compresses raw interleaved samples to a JPEG XL codestream. Lossless
 // uses the pure-Go Modular encoder (any size, 8/16-bit, 1/3 channels); lossy
-// uses the pure-Go VarDCT encoder (8-bit, 1/3 channels, up to 16384px). Requests
+// uses the pure-Go VarDCT encoder (8/16-bit, 1/3 channels, up to 16384px). Requests
 // outside those subsets error so a native backend can take over.
 func (gojpegxlBackend) Encode(raw []byte, width uint16, height uint16, samples uint16, bitsa uint16, lossless bool) (out []byte, err error) {
 	defer func() {
@@ -61,10 +61,36 @@ func (gojpegxlBackend) Encode(raw []byte, width uint16, height uint16, samples u
 		}
 	}()
 	if !lossless {
-		if bitsa != 8 {
-			return nil, errors.New("jpegxl: pure-Go lossy encode supports 8-bit only")
+		if bitsa != 8 && bitsa != 16 {
+			return nil, errors.New("jpegxl: pure-Go lossy encode supports 8-bit and 16-bit only")
 		}
-		return gojxl.EncodeVarDCT(raw, int(width), int(height), int(samples), kLossyGlobalScale)
+		scale := kLossyGlobalScale
+		if bitsa == 16 && len(raw) >= 2 {
+			// Medical 16-bit DICOM images (e.g. 10–12 bits stored in 16-bit
+			// containers) often use only a small fraction of [0, 65535]. Scale
+			// globalScale so the active signal range gets comparable DCT
+			// quantization precision to a full-range image.
+			var peak uint16
+			for i := 0; i+1 < len(raw); i += 2 {
+				v := uint16(raw[i]) | uint16(raw[i+1])<<8
+				if v > peak {
+					peak = v
+				}
+			}
+			if peak > 0 && peak < 32768 {
+				// Boost quantizer precision for narrow-dynamic-range 16-bit frames,
+				// capped at 65536 (maximum 16-bit U32 globalScale).
+				boost := 65535 / int(peak)
+				if boost > 8 {
+					boost = 8
+				}
+				scale *= boost
+				if scale > 65536 {
+					scale = 65536
+				}
+			}
+		}
+		return gojxl.EncodeVarDCTWithBitDepth(raw, int(width), int(height), int(samples), int(bitsa), scale)
 	}
 	return gojxl.Encode(raw, int(width), int(height), int(samples), int(bitsa))
 }

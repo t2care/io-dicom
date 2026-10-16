@@ -14,6 +14,12 @@ import (
 	"github.com/innovative-io/io-dicom/transcoder"
 )
 
+func TestTranscode(t *testing.T) {
+	ts := transfersyntax.JPEGXLLossless
+	o, _ := media.NewDCMObjFromFile("../testdata/MR")
+	transcoder.ChangeTransferSyntax(o, ts)
+	o.WriteToFile(ts.Name)
+}
 func TestNewDCMObjFromFile(t *testing.T) {
 	if _, err := os.Stat("../testdata/test2.dcm"); err != nil {
 		t.Skipf("sample fixtures unavailable: %v", err)
@@ -211,7 +217,7 @@ func Test_dcmObj_ChangeTransferSyntax(t *testing.T) {
 			name:     "Should change transfer syntax to JPEGXL",
 			fileName: "../testdata/test2.dcm",
 			args:     args{transfersyntax.JPEGXL},
-			wantErr:  true, // pure-Go encoder is lossless-Modular only (no lossy VarDCT)
+			wantErr:  false, // pure-Go lossy VarDCT JPEG XL encoder (8/16-bit)
 		},
 		{
 			name:     "Should change transfer syntax to MPEG2MPML",

@@ -377,6 +377,42 @@ func reconstructVarDCT(st *vardctState) (*Image, error) {
 		colorCh = 1
 	}
 	nc := colorCh + len(st.extra)
+	bitDepth := int(st.meta.BitDepth.BitsPerSample)
+	if bitDepth == 0 {
+		bitDepth = 8
+	}
+	if bitDepth > 8 {
+		maxVal := float32((int(1) << bitDepth) - 1)
+		maxInt := (int(1) << bitDepth) - 1
+		pix := make([]byte, W*H*nc*2)
+		for i := 0; i < W*H; i++ {
+			r, g, b := xybToLinearRGB(planeX[i], planeY[i], planeB[i])
+			base := (i * nc) * 2
+			rv := clampN(linearToSRGB(r), maxVal)
+			pix[base] = byte(rv)
+			pix[base+1] = byte(rv >> 8)
+			if !gray {
+				gv := clampN(linearToSRGB(g), maxVal)
+				bv := clampN(linearToSRGB(b), maxVal)
+				pix[base+2] = byte(gv)
+				pix[base+3] = byte(gv >> 8)
+				pix[base+4] = byte(bv)
+				pix[base+5] = byte(bv >> 8)
+			}
+			for ec := range st.extra {
+				v := int(st.extra[ec][i])
+				if v < 0 {
+					v = 0
+				} else if v > maxInt {
+					v = maxInt
+				}
+				off := base + (colorCh+ec)*2
+				pix[off] = byte(v)
+				pix[off+1] = byte(v >> 8)
+			}
+		}
+		return &Image{W: W, H: H, Channels: nc, BitDepth: bitDepth, Pixels: pix}, nil
+	}
 	pix := make([]byte, W*H*nc)
 	for i := 0; i < W*H; i++ {
 		r, g, b := xybToLinearRGB(planeX[i], planeY[i], planeB[i])
@@ -408,4 +444,15 @@ func clamp8(v float32) byte {
 		return 255
 	}
 	return byte(x)
+}
+
+func clampN(v, maxVal float32) uint16 {
+	x := v*maxVal + 0.5
+	if x < 0 {
+		return 0
+	}
+	if x > maxVal {
+		return uint16(maxVal)
+	}
+	return uint16(x)
 }
